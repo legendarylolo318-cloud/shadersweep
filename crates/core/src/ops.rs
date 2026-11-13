@@ -4,11 +4,14 @@ use crate::guard::{Allowlist, ProcessProbe};
 use crate::scan::Inventory;
 use serde::Serialize;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default)]
 pub struct Selection {
+    /// Every cache of these app ids, in every library (CLI).
     pub appids: Vec<u32>,
+    /// Exactly these cache directories (GUI selection; one library only).
+    pub paths: Vec<PathBuf>,
     pub orphaned: bool,
     /// Indices into `Inventory::globals`.
     pub globals: Vec<usize>,
@@ -21,6 +24,8 @@ pub struct PlanItem {
     pub path: PathBuf,
     pub size: u64,
     pub files: u64,
+    /// `(st_dev, st_ino)` recorded at scan time; re-verified right before deleting.
+    pub identity: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,7 +94,10 @@ pub fn plan_clear(
     };
 
     for e in &inv.entries {
-        if sel.appids.contains(&e.appid) || (sel.orphaned && e.orphaned()) {
+        if sel.appids.contains(&e.appid)
+            || sel.paths.contains(&e.path)
+            || (sel.orphaned && e.orphaned())
+        {
             consider(
                 &mut plan,
                 PlanItem {
@@ -98,6 +106,7 @@ pub fn plan_clear(
                     path: e.path.clone(),
                     size: e.size,
                     files: e.files,
+                    identity: (e.ino != 0).then_some((e.dev, e.ino)),
                 },
             );
         }
@@ -112,6 +121,7 @@ pub fn plan_clear(
                     path: g.path.clone(),
                     size: g.size,
                     files: g.files,
+                    identity: (g.ino != 0).then_some((g.dev, g.ino)),
                 },
             );
         }
@@ -134,19 +144,7 @@ pub fn execute(
                 .push((item.clone(), "game is currently running".into()));
             continue;
         }
-        let canon = match allow.check(&item.path) {
-            Ok(c) => c,
-            Err(e) => {
-                rep.failed.push((item.clone(), e.to_string()));
-                continue;
-            }
-        };
-        let res = match mode {
-            DeleteMode::Trash => trash::delete(&canon).map_err(|e| e.to_string()),
-            // remove_dir_all never follows symlinks.
-            DeleteMode::Permanent => fs::remove_dir_all(&canon).map_err(|e| e.to_string()),
-        };
-        match res {
+        match remove_checked(allow, &item.path, item.identity, mode) {
             Ok(()) => {
                 rep.freed += item.size;
                 rep.done.push(item.clone());
@@ -155,4 +153,28 @@ pub fn execute(
         }
     }
     rep
+}
+
+/// The only function in shadersweep that removes files.
+///
+/// Re-validates `path` against the allowlist (canonical path, protected-path denial, no
+/// symlink, same inode as at scan time) immediately before acting on the canonical path.
+/// `remove_dir_all` does not follow symlinks while recursing (it walks with
+/// `openat(O_NOFOLLOW)`/`unlinkat`), and the trash crate moves the directory with `rename`
+/// (or, across filesystems, copies symlinks as links and then removes the source).
+pub fn remove_checked(
+    allow: &Allowlist,
+    path: &Path,
+    identity: Option<(u64, u64)>,
+    mode: DeleteMode,
+) -> Result<(), String> {
+    let canon = allow
+        .check_identity(path, identity)
+        .map_err(|e| e.to_string())?;
+    match mode {
+        DeleteMode::Trash => {
+            trash::delete(&canon).map_err(|e| format!("moving to Trash failed: {e}"))
+        }
+        DeleteMode::Permanent => fs::remove_dir_all(&canon).map_err(|e| e.to_string()),
+    }
 }

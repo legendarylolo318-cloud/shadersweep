@@ -34,16 +34,25 @@ fn mtime(md: &fs::Metadata) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
-/// Allocated bytes (like `du`).
-fn alloc(md: &fs::Metadata) -> u64 {
-    md.blocks() * 512
+/// Apparent size in bytes, matching `du -sb` (coreutils counts directories as 0 there).
+fn bytes(md: &fs::Metadata) -> u64 {
+    if md.is_dir() {
+        0
+    } else {
+        md.len()
+    }
 }
 
 fn walk(path: &Path) -> (u64, u64, Option<u64>) {
     let (mut size, mut files, mut m) = (0u64, 0u64, None::<u64>);
+    // Like du, count a hard-linked inode only once.
+    let mut links: HashSet<(u64, u64)> = HashSet::new();
     for e in WalkDir::new(path).follow_links(false).into_iter().flatten() {
         if let Ok(md) = e.metadata() {
-            size += alloc(&md);
+            if !md.is_dir() && md.nlink() > 1 && !links.insert((md.dev(), md.ino())) {
+                continue;
+            }
+            size += bytes(&md);
             if !md.is_dir() {
                 files += 1;
             }
@@ -69,7 +78,7 @@ pub fn dir_stats(path: &Path) -> DirStats {
                 walk(&e.path())
             } else {
                 match fs::symlink_metadata(e.path()) {
-                    Ok(md) => (alloc(&md), 1, mtime(&md)),
+                    Ok(md) => (bytes(&md), 1, mtime(&md)),
                     Err(_) => (0, 0, None),
                 }
             };
@@ -77,7 +86,7 @@ pub fn dir_stats(path: &Path) -> DirStats {
         })
         .collect();
     let mut st = DirStats {
-        size: own.as_ref().map(alloc).unwrap_or(0),
+        size: own.as_ref().map(bytes).unwrap_or(0),
         modified: own.as_ref().and_then(mtime),
         ..Default::default()
     };
@@ -111,6 +120,7 @@ pub struct CacheEntry {
     pub compat_path: Option<PathBuf>,
     pub children: Vec<ChildStat>,
     pub dev: u64,
+    pub ino: u64,
 }
 
 impl CacheEntry {
@@ -134,6 +144,8 @@ pub struct GlobalCache {
     pub files: u64,
     pub modified: Option<u64>,
     pub children: Vec<ChildStat>,
+    pub dev: u64,
+    pub ino: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -172,12 +184,16 @@ impl ScanOptions {
 
 #[derive(Debug, Clone, Default)]
 pub struct Inventory {
+    /// `$HOME` the scan ran against (protected from deletion).
+    pub home: Option<PathBuf>,
     pub installs: Vec<SteamInstall>,
     pub libraries: Vec<Library>,
     pub entries: Vec<CacheEntry>,
     pub globals: Vec<GlobalCache>,
     pub warnings: Vec<String>,
     pub scan_ms: u128,
+    /// Display name of each library's drive, parallel to `libraries` (computed once per scan).
+    pub drives: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -187,11 +203,21 @@ pub struct Progress {
     pub current: String,
 }
 
-/// An env override is only honoured if it can't plausibly be `/` or `$HOME` or a parent of it.
-fn env_override_ok(canon: &Path, home: &Path) -> bool {
-    let home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    canon.components().count() >= 4 && !home.starts_with(canon)
+/// An env override is only honoured if it can't plausibly be `/`, `$HOME`, the XDG cache dir,
+/// or a parent of any of them.
+fn env_override_ok(canon: &Path, home: &Path, cache_home: &Path) -> bool {
+    let c = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon.components().count() >= 4
+        && !c(home).starts_with(canon)
+        && !c(cache_home).starts_with(canon)
 }
+
+/// Cache directory names Mesa creates (multi-file, single-file, database layouts).
+const MESA_DIRS: [&str; 3] = [
+    "mesa_shader_cache",
+    "mesa_shader_cache_sf",
+    "mesa_shader_cache_db",
+];
 
 fn discover_globals(
     opts: &ScanOptions,
@@ -201,6 +227,11 @@ fn discover_globals(
         (
             "Mesa shader cache".into(),
             opts.cache_home.join("mesa_shader_cache"),
+            GlobalSource::Default,
+        ),
+        (
+            "Mesa shader cache (single file)".into(),
+            opts.cache_home.join("mesa_shader_cache_sf"),
             GlobalSource::Default,
         ),
         (
@@ -226,8 +257,28 @@ fn discover_globals(
             }
         }
     }
+    // Overrides name a *parent* directory; the drivers create their cache dir inside it
+    // (Mesa: `<dir>/mesa_shader_cache*`, NVIDIA: `<dir>/GLCache`). Only those subdirectories
+    // are ever offered, never the user-chosen directory itself, which may hold other data.
     for (k, v) in &opts.env {
-        cands.push((format!("${k}"), PathBuf::from(v), GlobalSource::Env));
+        let base = PathBuf::from(v);
+        if !base.is_absolute() {
+            warnings.push(format!("${k}={v} rejected (relative path)"));
+            continue;
+        }
+        match k.as_str() {
+            "MESA_SHADER_CACHE_DIR" => {
+                for d in MESA_DIRS {
+                    cands.push((format!("${k}/{d}"), base.join(d), GlobalSource::Env));
+                }
+            }
+            "__GL_SHADER_DISK_CACHE_PATH" => {
+                cands.push((format!("${k}/GLCache"), base.join("GLCache"), GlobalSource::Env));
+            }
+            _ => warnings.push(format!(
+                "${k} is set ({v}); files there are not managed by shadersweep (the directory may hold other data)"
+            )),
+        }
     }
     let mut out: Vec<(String, PathBuf, GlobalSource)> = Vec::new();
     for (label, p, src) in cands {
@@ -242,11 +293,8 @@ fn discover_globals(
         let Ok(canon) = fs::canonicalize(&p) else {
             continue;
         };
-        if src == GlobalSource::Env && (!p.is_absolute() || !env_override_ok(&canon, &opts.home)) {
-            warnings.push(format!(
-                "{label}={} rejected (too broad or relative)",
-                p.display()
-            ));
+        if src == GlobalSource::Env && !env_override_ok(&canon, &opts.home, &opts.cache_home) {
+            warnings.push(format!("{label}={} rejected (too broad)", p.display()));
             continue;
         }
         if out.iter().any(|(_, c, _)| *c == canon) {
@@ -261,6 +309,7 @@ fn discover_globals(
 pub fn scan(opts: &ScanOptions, progress: &(dyn Fn(Progress) + Sync)) -> Inventory {
     let t0 = Instant::now();
     let mut inv = Inventory {
+        home: Some(opts.home.clone()),
         installs: steam::find_installs(&opts.home),
         ..Default::default()
     };
@@ -288,6 +337,16 @@ pub fn scan(opts: &ScanOptions, progress: &(dyn Fn(Progress) + Sync)) -> Invento
     let mut todo: Vec<(usize, u32, PathBuf)> = Vec::new();
     for (li, l) in inv.libraries.iter().enumerate() {
         let sc = l.steamapps.join("shadercache");
+        if let Ok(c) = fs::canonicalize(&sc) {
+            if c.file_name().is_none_or(|n| n != "shadercache") {
+                warnings.push(format!(
+                    "{} resolves to {}, which is not a shadercache directory; ignored for safety",
+                    sc.display(),
+                    c.display()
+                ));
+                continue;
+            }
+        }
         let Ok(rd) = fs::read_dir(&sc) else { continue };
         for e in rd.flatten() {
             let Ok(ft) = e.file_type() else { continue };
@@ -324,6 +383,7 @@ pub fn scan(opts: &ScanOptions, progress: &(dyn Fn(Progress) + Sync)) -> Invento
     let mut entries: Vec<CacheEntry> = todo
         .par_iter()
         .map(|(li, appid, path)| {
+            let id = crate::guard::identity(path).unwrap_or((0, 0));
             let st = dir_stats(path);
             let lib = &libs[*li];
             let compat = lib.steamapps.join("compatdata").join(appid.to_string());
@@ -348,7 +408,8 @@ pub fn scan(opts: &ScanOptions, progress: &(dyn Fn(Progress) + Sync)) -> Invento
                 is_shortcut: shortcut.is_some() && !manifests.contains_key(appid),
                 compat_path: compat.is_dir().then_some(compat),
                 children: st.children,
-                dev: fs::metadata(path).map(|m| m.dev()).unwrap_or(0),
+                dev: id.0,
+                ino: id.1,
             }
         })
         .collect();
@@ -363,6 +424,7 @@ pub fn scan(opts: &ScanOptions, progress: &(dyn Fn(Progress) + Sync)) -> Invento
     inv.globals = globals
         .par_iter()
         .map(|(label, path, src)| {
+            let id = crate::guard::identity(path).unwrap_or((0, 0));
             let st = dir_stats(path);
             tick(label.clone());
             GlobalCache {
@@ -373,10 +435,17 @@ pub fn scan(opts: &ScanOptions, progress: &(dyn Fn(Progress) + Sync)) -> Invento
                 files: st.files,
                 modified: st.modified,
                 children: st.children,
+                dev: id.0,
+                ino: id.1,
             }
         })
         .collect();
 
+    inv.drives = inv
+        .libraries
+        .iter()
+        .map(|l| mount_point(&l.path).unwrap_or_else(|| l.path.display().to_string()))
+        .collect();
     inv.warnings = warnings;
     inv.scan_ms = t0.elapsed().as_millis();
     inv
@@ -394,6 +463,9 @@ impl Inventory {
 
     /// Display name of the drive a library lives on (mount point when determinable).
     pub fn drive_name(&self, library_index: usize) -> String {
+        if let Some(d) = self.drives.get(library_index) {
+            return d.clone();
+        }
         let Some(l) = self.libraries.get(library_index) else {
             return "?".into();
         };

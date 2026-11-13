@@ -126,7 +126,8 @@ fn multiple_libraries_dedupe_and_names() -> R {
     let by = |id: u32| inv.entries.iter().find(|e| e.appid == id);
     assert_eq!(by(100).map(|e| e.name.as_str()), Some("Installed Game"));
     assert_eq!(by(200).map(|e| e.name.as_str()), Some("Far Game"));
-    assert!(by(200).is_some_and(|e| e.installed && e.size > 7000));
+    // Apparent bytes of files only, like `du -sb`: 7000 + 100.
+    assert!(by(200).is_some_and(|e| e.installed && e.size == 7100));
     assert!(by(100).is_some_and(|e| e.compat_path.is_some() && e.files == 2));
     Ok(())
 }
@@ -181,10 +182,22 @@ fn global_caches_and_env_override() -> R {
     let labels: Vec<&str> = inv.globals.iter().map(|g| g.label.as_str()).collect();
     assert!(labels.iter().any(|l| l.starts_with("Mesa shader cache")));
     assert!(labels.iter().any(|l| l.contains("radv_builtin_shaders64")));
-    assert!(labels.contains(&"$DXVK_STATE_CACHE_PATH"));
-    assert!(!labels.contains(&"$MESA_SHADER_CACHE_DIR"));
-    assert!(!labels.contains(&"$__GL_SHADER_DISK_CACHE_PATH"));
-    assert!(inv.warnings.iter().any(|w| w.contains("rejected")));
+    // DXVK_STATE_CACHE_PATH is a shared user directory: reported, never offered for deletion.
+    assert!(!labels.iter().any(|l| l.contains("DXVK")));
+    assert!(inv
+        .warnings
+        .iter()
+        .any(|w| w.contains("DXVK_STATE_CACHE_PATH")));
+    assert!(!labels
+        .iter()
+        .any(|l| l.starts_with("$MESA_SHADER_CACHE_DIR")));
+    assert!(!labels
+        .iter()
+        .any(|l| l.starts_with("$__GL_SHADER_DISK_CACHE_PATH")));
+    assert!(inv
+        .globals
+        .iter()
+        .all(|g| g.path != home && g.path != Path::new("/")));
     Ok(())
 }
 
@@ -197,8 +210,8 @@ fn allowlist_rejects_outside_dotdot_and_symlinks() -> R {
     assert!(allow.check(&sc.join("100")).is_ok());
     // the container itself, its parents, home, deeper paths
     assert!(matches!(allow.check(&sc), Err(GuardError::Outside(_))));
-    assert!(matches!(allow.check(&steam), Err(GuardError::Outside(_))));
-    assert!(matches!(allow.check(&home), Err(GuardError::Outside(_))));
+    assert!(matches!(allow.check(&steam), Err(GuardError::Protected(_))));
+    assert!(matches!(allow.check(&home), Err(GuardError::Protected(_))));
     assert!(matches!(
         allow.check(&sc.join("100/fozpipelinesv6")),
         Err(GuardError::Outside(_))
@@ -234,7 +247,7 @@ fn allowlist_rejects_outside_dotdot_and_symlinks() -> R {
     fs::create_dir_all(steam.join("steamapps/compatdata/100"))?;
     assert!(matches!(
         allow.check(&steam.join("steamapps/compatdata/100")),
-        Err(GuardError::Outside(_))
+        Err(GuardError::Protected(_))
     ));
     assert!(victim.join("precious").exists());
     Ok(())
