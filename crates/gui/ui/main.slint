@@ -69,6 +69,7 @@ export component MainWindow inherits Window {
     in property <string> gpu-banner;
     in property <string> precache-text;
     in property <bool> scanning;
+    in property <bool> clearing;
     in property <float> progress;
     in property <string> detail-title;
     in property <string> detail-text;
@@ -176,17 +177,17 @@ export component MainWindow inherits Window {
                     height: 34px;
                     Button {
                         text: "Clear orphaned (" + root.orphan-count + ", " + root.orphan-size + ")";
-                        enabled: root.orphan-count > 0 && !root.scanning;
+                        enabled: root.orphan-count > 0 && !root.scanning && !root.clearing;
                         clicked => { root.request-clear(1, false); }
                     }
                     Button {
                         text: "Clear selected (" + root.selected-count + ", " + root.selected-size + ")";
-                        enabled: root.selected-count > 0 && !root.scanning;
+                        enabled: root.selected-count > 0 && !root.scanning && !root.clearing;
                         clicked => { root.request-clear(0, false); }
                     }
                     Button {
                         text: "Rebuild selected";
-                        enabled: root.selected-count > 0 && !root.scanning;
+                        enabled: root.selected-count > 0 && !root.scanning && !root.clearing;
                         clicked => { root.request-clear(0, true); }
                     }
                     Rectangle { horizontal-stretch: 1; }
@@ -298,8 +299,8 @@ export component MainWindow inherits Window {
                             Text { text: root.detail-extra; color: Pal.dim; font-size: 12px; wrap: word-wrap; }
                             HorizontalLayout {
                                 spacing: 8px;
-                                Button { text: "Clear this cache"; clicked => { root.request-clear(2, false); } }
-                                Button { text: "Rebuild"; clicked => { root.request-clear(2, true); } }
+                                Button { text: "Clear this cache"; enabled: !root.clearing; clicked => { root.request-clear(2, false); } }
+                                Button { text: "Rebuild"; enabled: !root.clearing; clicked => { root.request-clear(2, true); } }
                             }
                         }
                         if root.detail-title == "": VerticalLayout {

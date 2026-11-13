@@ -11,10 +11,10 @@ use shadersweep_core::stats;
 use shadersweep_core::util::{format_date, human_size};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 slint::include_modules!();
 
@@ -40,6 +40,31 @@ struct App {
     watcher: Option<RecommendedWatcher>,
     auto: bool,
     gpu_banner: String,
+    /// A clear is running on a worker thread.
+    clearing: bool,
+    /// File-watcher events before this instant are our own (scan/clear) and are ignored.
+    quiet_until: Instant,
+    /// Proton prefix sizes, computed once per prefix per scan (`None` = being computed).
+    compat_sizes: HashMap<PathBuf, Option<String>>,
+    /// Last result of the background process probe.
+    running: HashSet<u32>,
+    steam_running: bool,
+}
+
+/// Minimum time between two automatic (watcher-triggered) rescans.
+const AUTO_RESCAN_MIN_GAP: Duration = Duration::from_secs(10);
+
+/// Only real content changes should trigger an auto-rescan. In particular `Access` events
+/// (inotify OPEN/CLOSE_NOWRITE, which notify subscribes to) are produced by our own scan
+/// reading the tree and used to cause an endless rescan loop.
+fn is_relevant(ev: &notify::Event) -> bool {
+    use notify::event::{EventKind, ModifyKind};
+    matches!(
+        ev.kind,
+        EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Modify(ModifyKind::Name(_) | ModifyKind::Data(_) | ModifyKind::Any)
+    )
 }
 
 thread_local! {
@@ -246,32 +271,32 @@ impl App {
         ui.set_detail_text(tr(text));
         ui.set_detail_extra(tr(""));
         if let Some(cp) = compat {
-            ui.set_detail_extra(tr(format!(
-                "Proton prefix (info only — contains saves, never touched):\n{}\n(sizing…)",
-                cp.display()
-            )));
-            let weak = ui.as_weak();
-            let d2 = d.clone();
-            std::thread::spawn(move || {
-                let st = scan::dir_stats(&cp);
-                let msg = format!(
-                    "Proton prefix (info only — contains saves, never touched):\n{}\n{} · {} files",
-                    cp.display(),
-                    human_size(st.size),
-                    st.files
-                );
-                let _ = weak.upgrade_in_event_loop(move |ui| {
-                    let same = APP.with(|a| {
-                        a.try_borrow()
-                            .ok()
-                            .and_then(|b| b.as_ref().map(|x| x.detail.as_ref() == Some(&d2)))
-                            .unwrap_or(false)
+            const HDR: &str = "Proton prefix (info only — contains saves, never touched):";
+            match self.compat_sizes.get(&cp) {
+                Some(Some(sz)) => {
+                    ui.set_detail_extra(tr(format!("{HDR}\n{}\n{sz}", cp.display())));
+                }
+                Some(None) => {
+                    ui.set_detail_extra(tr(format!("{HDR}\n{}\n(sizing…)", cp.display())));
+                }
+                None => {
+                    ui.set_detail_extra(tr(format!("{HDR}\n{}\n(sizing…)", cp.display())));
+                    self.compat_sizes.insert(cp.clone(), None);
+                    let weak = ui.as_weak();
+                    std::thread::spawn(move || {
+                        let st = scan::dir_stats(&cp);
+                        let sz = format!("{} · {} files", human_size(st.size), st.files);
+                        let _ = weak.upgrade_in_event_loop(move |_| {
+                            with_app(|app, ui| {
+                                if let Some(slot) = app.compat_sizes.get_mut(&cp) {
+                                    *slot = Some(sz);
+                                }
+                                app.refresh_detail(&ui);
+                            });
+                        });
                     });
-                    if same {
-                        ui.set_detail_extra(tr(msg));
-                    }
-                });
-            });
+                }
+            }
         }
     }
 
@@ -286,6 +311,13 @@ impl App {
         let weak = ui.as_weak();
         std::thread::spawn(move || {
             let Ok(opts) = ScanOptions::from_env() else {
+                let _ = weak.upgrade_in_event_loop(|_| {
+                    with_app(|app, ui| {
+                        app.scanning = false;
+                        ui.set_scanning(false);
+                        ui.set_status_text(tr("Scan failed: cannot determine the home directory"));
+                    });
+                });
                 return;
             };
             let w2 = weak.clone();
@@ -335,7 +367,10 @@ impl App {
         }
         ui.set_status_text(tr(format!("Scanned in {} ms", inv.scan_ms)));
         self.inv = inv;
+        self.compat_sizes.clear();
         self.scanning = false;
+        // Our own reads may still be queued in the watcher; don't let them trigger a rescan.
+        self.quiet_until = Instant::now() + Duration::from_secs(2);
         ui.set_scanning(false);
         if !extras.gpu_banner.is_empty() {
             self.gpu_banner = extras.gpu_banner;
@@ -348,8 +383,7 @@ impl App {
     }
 
     fn update_steam_banner(&self, ui: &MainWindow) {
-        let probe = ProcfsProbe::default();
-        let running = probe.running_appids();
+        let running = &self.running;
         let msg = if !running.is_empty() {
             let names: Vec<String> = running
                 .iter()
@@ -366,7 +400,7 @@ impl App {
                 "Running game(s): {}. Their caches cannot be cleared until they exit.",
                 names.join(", ")
             )
-        } else if probe.steam_running() {
+        } else if self.steam_running {
             "Steam is running. Clearing works, but closing Steam first is safest.".to_string()
         } else {
             String::new()
@@ -380,8 +414,10 @@ impl App {
             return;
         }
         let (tx, rx) = mpsc::channel::<()>();
-        let Ok(mut w) = notify::recommended_watcher(move |_| {
-            let _ = tx.send(());
+        let Ok(mut w) = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if res.is_ok_and(|ev| is_relevant(&ev)) {
+                let _ = tx.send(());
+            }
         }) else {
             return;
         };
@@ -394,16 +430,27 @@ impl App {
         }
         let weak = self.ui.clone();
         std::thread::spawn(move || {
+            let mut last = Instant::now() - AUTO_RESCAN_MIN_GAP;
             // Debounce: wait for a quiet period before asking for a rescan.
             while rx.recv().is_ok() {
                 while rx.recv_timeout(Duration::from_secs(3)).is_ok() {}
-                let _ = weak.upgrade_in_event_loop(|_| {
+                let gap = last.elapsed();
+                if gap < AUTO_RESCAN_MIN_GAP {
+                    std::thread::sleep(AUTO_RESCAN_MIN_GAP - gap);
+                    while rx.try_recv().is_ok() {}
+                }
+                last = Instant::now();
+                let posted = weak.upgrade_in_event_loop(|_| {
                     with_app(|app, ui| {
-                        if app.auto && !app.scanning {
+                        let ours = app.scanning || app.clearing || Instant::now() < app.quiet_until;
+                        if app.auto && !ours {
                             app.start_scan(&ui);
                         }
                     });
                 });
+                if posted.is_err() {
+                    break;
+                }
             }
         });
         self.watcher = Some(w);
@@ -415,7 +462,7 @@ impl App {
             0 => {
                 for e in &self.inv.entries {
                     if self.selected.contains(&e.path) {
-                        sel.appids.push(e.appid);
+                        sel.paths.push(e.path.clone());
                     }
                 }
                 for (i, g) in self.inv.globals.iter().enumerate() {
@@ -427,8 +474,8 @@ impl App {
             1 => sel.orphaned = true,
             _ => match &self.detail {
                 Some(Detail::Game(p)) => {
-                    if let Some(e) = self.inv.entries.iter().find(|e| &e.path == p) {
-                        sel.appids.push(e.appid);
+                    if self.inv.entries.iter().any(|e| &e.path == p) {
+                        sel.paths.push(p.clone());
                     }
                 }
                 Some(Detail::Global(p)) => {
@@ -439,7 +486,23 @@ impl App {
                 None => {}
             },
         }
-        let plan = ops::plan_clear(&self.inv, &self.allow, &ProcfsProbe::default(), &sel);
+        if self.clearing {
+            ui.set_status_text(tr("A clear is already in progress"));
+            return;
+        }
+        // Planning reads /proc and stats every path: do it off the UI thread.
+        let inv = self.inv.clone();
+        let allow = self.allow.clone();
+        let weak = ui.as_weak();
+        std::thread::spawn(move || {
+            let plan = ops::plan_clear(&inv, &allow, &ProcfsProbe::default(), &sel);
+            let _ = weak.upgrade_in_event_loop(move |_| {
+                with_app(|app, ui| app.show_confirm(&ui, plan, rebuild));
+            });
+        });
+    }
+
+    fn show_confirm(&mut self, ui: &MainWindow, plan: ClearPlan, rebuild: bool) {
         if plan.items.is_empty() {
             let why: Vec<String> = plan
                 .refused
@@ -464,7 +527,7 @@ impl App {
         }
         let mut note = String::new();
         if rebuild {
-            note.push_str("Rebuild = clear. Steam re-downloads pre-cached shaders or recompiles them on the next launch of the game (first launch may stutter). ");
+            note.push_str("Rebuild = clear. shadersweep does not compile shaders itself: Steam re-downloads pre-cached shaders (if Shader Pre-Caching is on) or the game recompiles them on its next launch (first launch may stutter). ");
         }
         if plan.steam_running {
             note.push_str("Steam is running — close it first if you can. ");
@@ -490,6 +553,8 @@ impl App {
             return;
         };
         ui.set_status_text(tr("Clearing…"));
+        self.clearing = true;
+        ui.set_clearing(true);
         let allow = self.allow.clone();
         let weak = ui.as_weak();
         std::thread::spawn(move || {
@@ -514,6 +579,9 @@ impl App {
             }
             let _ = weak.upgrade_in_event_loop(move |_| {
                 with_app(|app, ui| {
+                    app.clearing = false;
+                    ui.set_clearing(false);
+                    app.quiet_until = Instant::now() + Duration::from_secs(5);
                     app.selected.clear();
                     app.start_scan(&ui);
                     ui.set_status_text(tr(msg));
@@ -541,6 +609,11 @@ fn main() -> Result<()> {
             watcher: None,
             auto: false,
             gpu_banner: String::new(),
+            clearing: false,
+            quiet_until: Instant::now(),
+            compat_sizes: HashMap::new(),
+            running: HashSet::new(),
+            steam_running: false,
         });
     });
 
@@ -640,13 +713,101 @@ fn main() -> Result<()> {
         });
     });
 
-    // Re-check for running Steam / games every few seconds.
-    let timer = slint::Timer::default();
-    timer.start(slint::TimerMode::Repeated, Duration::from_secs(4), || {
-        with_app(|a, ui| a.update_steam_banner(&ui));
+    // Re-check for running Steam / games every few seconds, on a worker thread
+    // (reading every /proc/<pid>/environ is blocking I/O). Exits with the event loop.
+    let weak = ui.as_weak();
+    std::thread::spawn(move || loop {
+        let probe = ProcfsProbe::default();
+        let running = probe.running_appids();
+        let steam = probe.steam_running();
+        let posted = weak.upgrade_in_event_loop(move |_| {
+            with_app(|a, ui| {
+                if a.running != running || a.steam_running != steam {
+                    a.running = running;
+                    a.steam_running = steam;
+                    a.update_steam_banner(&ui);
+                }
+            });
+        });
+        if posted.is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(4));
     });
 
     with_app(|a, ui| a.start_scan(&ui));
     ui.run().context("running UI")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::{
+        AccessKind, AccessMode, CreateKind, DataChange, EventKind, MetadataKind, ModifyKind,
+        RemoveKind, RenameMode,
+    };
+
+    fn ev(kind: EventKind) -> notify::Event {
+        notify::Event::new(kind)
+    }
+
+    #[test]
+    fn scan_reads_do_not_trigger_rescans() {
+        assert!(!is_relevant(&ev(EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        )))));
+        assert!(!is_relevant(&ev(EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        )))));
+        assert!(!is_relevant(&ev(EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::Any
+        )))));
+        assert!(!is_relevant(&ev(EventKind::Other)));
+        assert!(is_relevant(&ev(EventKind::Create(CreateKind::Folder))));
+        assert!(is_relevant(&ev(EventKind::Remove(RemoveKind::Folder))));
+        assert!(is_relevant(&ev(EventKind::Modify(ModifyKind::Name(
+            RenameMode::From
+        )))));
+        assert!(is_relevant(&ev(EventKind::Modify(ModifyKind::Data(
+            DataChange::Content
+        )))));
+    }
+
+    /// Real inotify: a scan of a watched tree produces only events that are filtered out.
+    #[test]
+    fn watcher_ignores_our_own_scan() {
+        let t = tempfile::tempdir().unwrap();
+        let sc = t.path().join("steamapps/shadercache/100/fozpipelinesv6");
+        std::fs::create_dir_all(&sc).unwrap();
+        std::fs::write(sc.join("a.foz"), b"x").unwrap();
+        let (tx, rx) = mpsc::channel::<bool>();
+        let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(e) = res {
+                let _ = tx.send(is_relevant(&e));
+            }
+        })
+        .unwrap();
+        w.watch(
+            &t.path().join("steamapps/shadercache"),
+            RecursiveMode::Recursive,
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        while rx.try_recv().is_ok() {}
+        let _ = scan::dir_stats(&t.path().join("steamapps/shadercache"));
+        std::thread::sleep(Duration::from_millis(300));
+        let evs: Vec<bool> = rx.try_iter().collect();
+        assert!(
+            !evs.is_empty(),
+            "expected raw OPEN/CLOSE events from the scan"
+        );
+        assert!(
+            evs.iter().all(|r| !r),
+            "scan produced a relevant event: {evs:?}"
+        );
+        std::fs::remove_dir_all(t.path().join("steamapps/shadercache/100")).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(rx.try_iter().any(|r| r), "deletion was not seen");
+    }
 }
