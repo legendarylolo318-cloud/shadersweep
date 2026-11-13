@@ -1,0 +1,56 @@
+name: Release AppImage
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  appimage:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install toolchain and build deps
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm base-devel git rust curl github-cli \
+            fontconfig freetype2 libxkbcommon wayland libx11 libxcursor libxrandr libxi mesa
+      - uses: actions/checkout@v4
+      - name: Mark checkout safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Check tag matches Cargo version
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != v$v"; exit 1; }
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - name: Build AppImage
+        run: ./build-appimage.sh
+      - name: Smoke test
+        run: |
+          ./dist/shadersweep-*-x86_64.AppImage --appimage-extract-and-run --version
+          ./dist/shadersweep-*-x86_64.AppImage --appimage-extract-and-run list
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage
+          path: dist/*
+      - name: Upload to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "shadersweep $tag" --notes "See README.md." dist/*
+            exit 0
+          fi
+          # Never replace assets already attached to a published release.
+          have=$(gh release view "$tag" --json assets --jq '.assets[].name')
+          for f in dist/*; do
+            if grep -qxF "$(basename "$f")" <<<"$have"; then
+              echo "$(basename "$f") already attached; leaving it"
+            else
+              gh release upload "$tag" "$f"
+            fi
+          done

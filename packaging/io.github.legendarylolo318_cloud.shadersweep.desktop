@@ -6,5 +6,5 @@ Comment=See and clear per-game shader cache disk usage
 Exec=shadersweep-gui
 Icon=shadersweep
 Terminal=false
-Categories=Utility;System;Game;
+Categories=Utility;System;
 Keywords=steam;shader;cache;cleanup;disk;
