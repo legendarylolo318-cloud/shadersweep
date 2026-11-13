@@ -71,6 +71,8 @@ enum Tok {
     Open,
     Close,
     End,
+    /// Unquoted platform conditional such as `[$WIN32]`; ignored.
+    Cond,
 }
 
 struct Text<'a> {
@@ -95,6 +97,15 @@ impl Text<'_> {
     }
 
     fn next(&mut self) -> Result<Tok, VdfError> {
+        loop {
+            match self.token()? {
+                Tok::Cond => continue,
+                t => return Ok(t),
+            }
+        }
+    }
+
+    fn token(&mut self) -> Result<Tok, VdfError> {
         self.skip_ws();
         let Some(&c) = self.b.get(self.pos) else {
             return Ok(Tok::End);
@@ -147,9 +158,11 @@ impl Text<'_> {
                 {
                     self.pos += 1;
                 }
-                Ok(Tok::Str(
-                    String::from_utf8_lossy(&self.b[start..self.pos]).into_owned(),
-                ))
+                let raw = &self.b[start..self.pos];
+                if raw.len() >= 2 && raw[0] == b'[' && raw[raw.len() - 1] == b']' {
+                    return Ok(Tok::Cond);
+                }
+                Ok(Tok::Str(String::from_utf8_lossy(raw).into_owned()))
             }
         }
     }
@@ -166,6 +179,7 @@ impl Text<'_> {
                 Tok::Close if depth > 0 => return Ok(items),
                 Tok::Close => return Err(VdfError::Syntax(self.pos, "unbalanced '}'")),
                 Tok::Open => return Err(VdfError::Syntax(self.pos, "'{' without key")),
+                Tok::Cond => continue,
                 Tok::Str(key) => match self.next()? {
                     Tok::Str(v) => items.push((key, Value::Str(v))),
                     Tok::Open => items.push((key, Value::Obj(self.object(depth + 1)?))),
@@ -282,6 +296,16 @@ mod tests {
     }
 
     #[test]
+    fn text_crlf_conditionals_escapes() {
+        let t = "\"A\"\r\n{\r\n\t\"path\"\t\t\"D:\\\\Games \\\"x\\\"\" [$WIN32]\r\n\t\"n\" { \"k\" \"v\" } [!$X360]\r\n\tbare value\r\n}\r\n";
+        let v = parse_text(t).unwrap();
+        let a = v.get("A").unwrap();
+        assert_eq!(a.get("path").unwrap().as_str(), Some("D:\\Games \"x\""));
+        assert_eq!(a.get("n").unwrap().get("k").unwrap().as_str(), Some("v"));
+        assert_eq!(a.get("bare").unwrap().as_str(), Some("value"));
+    }
+
+    #[test]
     fn text_errors() {
         assert!(parse_text("\"a\" {").is_err());
         assert!(parse_text("}").is_err());
@@ -305,5 +329,137 @@ mod tests {
     fn binary_truncated() {
         assert!(parse_binary(b"\x00shortcuts\x00\x01a\x00b").is_err());
         assert_eq!(parse_binary(b"\x09x\x00"), Err(VdfError::BadType(9)));
+    }
+}
+
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn quote(s: &str) -> String {
+        let mut o = String::from("\"");
+        for c in s.chars() {
+            match c {
+                '"' => o.push_str("\\\""),
+                '\\' => o.push_str("\\\\"),
+                '\n' => o.push_str("\\n"),
+                '\t' => o.push_str("\\t"),
+                c => o.push(c),
+            }
+        }
+        o.push('"');
+        o
+    }
+
+    fn value() -> impl Strategy<Value = Value> {
+        let leaf = any::<String>().prop_map(Value::Str);
+        leaf.prop_recursive(5, 64, 6, |inner| {
+            prop::collection::vec((any::<String>(), inner), 0..6).prop_map(Value::Obj)
+        })
+    }
+
+    fn emit(v: &[(String, Value)], nl: &str, out: &mut String) {
+        for (k, v) in v {
+            out.push_str(&quote(k));
+            match v {
+                Value::Str(s) => {
+                    out.push('\t');
+                    out.push_str(&quote(s));
+                    out.push_str(nl);
+                }
+                Value::Obj(items) => {
+                    out.push_str(nl);
+                    out.push('{');
+                    out.push_str(nl);
+                    emit(items, nl, out);
+                    out.push('}');
+                    out.push_str(nl);
+                }
+                Value::Int(_) => unreachable!(),
+            }
+        }
+    }
+
+    fn emit_bin(v: &[(String, Value)], out: &mut Vec<u8>) {
+        for (k, v) in v {
+            match v {
+                Value::Str(s) => {
+                    out.push(1);
+                    out.extend(k.replace('\0', "").as_bytes());
+                    out.push(0);
+                    out.extend(s.replace('\0', "").as_bytes());
+                    out.push(0);
+                }
+                Value::Obj(items) => {
+                    out.push(0);
+                    out.extend(k.replace('\0', "").as_bytes());
+                    out.push(0);
+                    emit_bin(items, out);
+                    out.push(8);
+                }
+                Value::Int(n) => {
+                    out.push(7);
+                    out.extend(k.replace('\0', "").as_bytes());
+                    out.push(0);
+                    out.extend(n.to_le_bytes());
+                }
+            }
+        }
+    }
+
+    fn strip_nul(v: &[(String, Value)]) -> Vec<(String, Value)> {
+        v.iter()
+            .map(|(k, v)| {
+                let k = k.replace('\0', "");
+                let v = match v {
+                    Value::Str(s) => Value::Str(s.replace('\0', "")),
+                    Value::Obj(i) => Value::Obj(strip_nul(i)),
+                    Value::Int(n) => Value::Int(*n),
+                };
+                (k, v)
+            })
+            .collect()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        #[test]
+        fn text_never_panics(s in any::<String>()) {
+            let _ = parse_text(&s);
+        }
+
+        #[test]
+        fn text_never_panics_on_vdf_like(s in "[\"{}\\\\ \t\r\na-z/\\[\\]$]{0,200}") {
+            let _ = parse_text(&s);
+        }
+
+        #[test]
+        fn binary_never_panics(b in prop::collection::vec(any::<u8>(), 0..512)) {
+            let _ = parse_binary(&b);
+        }
+
+        #[test]
+        fn binary_never_panics_on_typed_noise(
+            b in prop::collection::vec(prop_oneof![0u8..=10, any::<u8>()], 0..512)
+        ) {
+            let _ = parse_binary(&b);
+        }
+
+        #[test]
+        fn text_roundtrip(items in prop::collection::vec((any::<String>(), value()), 0..6), crlf in any::<bool>()) {
+            let mut t = String::new();
+            emit(&items, if crlf { "\r\n" } else { "\n" }, &mut t);
+            prop_assert_eq!(parse_text(&t).unwrap(), Value::Obj(items));
+        }
+
+        #[test]
+        fn binary_roundtrip(items in prop::collection::vec((any::<String>(), value()), 0..6)) {
+            let items = strip_nul(&items);
+            let mut b = Vec::new();
+            emit_bin(&items, &mut b);
+            prop_assert_eq!(parse_binary(&b).unwrap(), Value::Obj(items));
+        }
     }
 }
