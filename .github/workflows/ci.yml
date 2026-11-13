@@ -1,0 +1,15 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install toolchain and build deps
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm base-devel git rust fontconfig freetype2 libxkbcommon wayland libx11 libxcursor libxrandr libxi mesa
+      - uses: actions/checkout@v4
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace

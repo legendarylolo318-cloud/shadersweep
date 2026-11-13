@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.shadersweep.shadersweep</id>
+  <name>shadersweep</name>
+  <summary>See and clear Steam shader cache disk usage</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>shadersweep shows how much disk space each game's shader cache uses, highlights caches left behind by uninstalled games, and lets you clear them safely (to the Trash by default).</p>
+    <p>shadersweep is an independent project and is not affiliated with or endorsed by Valve Corporation.</p>
+  </description>
+  <launchable type="desktop-id">shadersweep.desktop</launchable>
+  <provides><binary>shadersweep</binary><binary>shadersweep-gui</binary></provides>
+  <categories><category>Utility</category><category>System</category></categories>
+  <content_rating type="oars-1.1"/>
+  <releases><release version="0.1.0" date="2026-11-13"/></releases>
+</component>

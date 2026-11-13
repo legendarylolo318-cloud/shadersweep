@@ -1,0 +1,362 @@
+import { CheckBox, LineEdit, ListView, Button, ScrollView, ProgressIndicator, Switch, Palette } from "std-widgets.slint";
+
+export struct Row {
+    id: int,
+    name: string,
+    appid: string,
+    library: string,
+    size: string,
+    frac: float,
+    modified: string,
+    status: string,
+    orphan: bool,
+    selected: bool,
+}
+
+global Pal {
+    in-out property <bool> dark: true;
+    out property <color> bg: dark ? #14161b : #f1f3f6;
+    out property <color> panel: dark ? #1b1e25 : #ffffff;
+    out property <color> alt: dark ? #171a20 : #f7f8fa;
+    out property <color> fg: dark ? #e6e8ee : #1d2330;
+    out property <color> dim: dark ? #8b93a5 : #5b6475;
+    out property <color> accent: #4c8dff;
+    out property <color> warn: #e0a030;
+    out property <color> danger: #e5534b;
+    out property <color> border: dark ? #2b2f3a : #d9dce3;
+}
+
+component Cell inherits Text {
+    color: Pal.fg;
+    font-size: 13px;
+    vertical-alignment: center;
+    overflow: elide;
+}
+
+component Head inherits Rectangle {
+    in property <string> label;
+    in property <bool> active;
+    in property <bool> asc;
+    callback clicked;
+    Text {
+        x: 4px;
+        text: root.label + (root.active ? (root.asc ? "  ▲" : "  ▼") : "");
+        color: root.active ? Pal.accent : Pal.dim;
+        font-size: 12px;
+        font-weight: 600;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    TouchArea { clicked => { root.clicked(); } }
+}
+
+export component MainWindow inherits Window {
+    title: "shadersweep";
+    icon: @image-url("../../../packaging/shadersweep.svg");
+    preferred-width: 1180px;
+    preferred-height: 720px;
+    min-width: 900px;
+    min-height: 520px;
+    background: Pal.bg;
+
+    in-out property <bool> dark <=> Pal.dark;
+    in property <[Row]> rows;
+    in property <[Row]> globals;
+    in property <string> stats-text;
+    in property <string> total-text;
+    in property <string> status-text;
+    in property <string> steam-banner;
+    in property <string> gpu-banner;
+    in property <string> precache-text;
+    in property <bool> scanning;
+    in property <float> progress;
+    in property <string> detail-title;
+    in property <string> detail-text;
+    in property <string> detail-extra;
+    in property <string> overview-text;
+    in property <int> selected-count;
+    in property <int> orphan-count;
+    in property <string> orphan-size;
+    in property <string> selected-size;
+
+    in-out property <string> search;
+    in-out property <bool> orphan-only;
+    in-out property <bool> auto-rescan;
+    in-out property <int> sort-col: 3;
+    in-out property <bool> sort-asc: false;
+
+    // confirmation dialog
+    in property <bool> confirm-visible;
+    in property <string> confirm-text;
+    in property <string> confirm-note;
+    in property <string> confirm-total;
+    in-out property <bool> confirm-permanent;
+
+    callback rescan();
+    callback sort-by(int);
+    callback toggle(int);
+    callback toggle-global(int);
+    callback open-row(int);
+    callback open-global(int);
+    callback filters-changed();
+    callback request-clear(int, bool);
+    callback select-all(bool);
+    callback confirm-ok(bool);
+    callback confirm-cancel();
+    callback auto-rescan-changed(bool);
+    callback theme-changed();
+
+    init => { Palette.color-scheme = dark ? ColorScheme.dark : ColorScheme.light; }
+    changed dark => { Palette.color-scheme = dark ? ColorScheme.dark : ColorScheme.light; }
+
+    VerticalLayout {
+        // ---------- stats header
+        Rectangle {
+            background: Pal.panel;
+            height: 58px;
+            HorizontalLayout {
+                padding: 10px;
+                spacing: 16px;
+                VerticalLayout {
+                    alignment: center;
+                    Text { text: "shadersweep"; color: Pal.fg; font-size: 18px; font-weight: 700; }
+                    Text { text: root.stats-text; color: Pal.dim; font-size: 12px; overflow: elide; }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                Text { text: root.precache-text; color: Pal.dim; font-size: 12px; vertical-alignment: center; }
+                Switch {
+                    text: "Dark";
+                    checked <=> root.dark;
+                    toggled => { root.theme-changed(); }
+                }
+            }
+            Rectangle { y: parent.height - 1px; height: 1px; background: Pal.border; }
+        }
+
+        if root.steam-banner != "": Rectangle {
+            background: #5a4310;
+            height: 28px;
+            Text { x: 12px; text: "⚠ " + root.steam-banner; color: #ffd98a; font-size: 12px; vertical-alignment: center; }
+        }
+        if root.gpu-banner != "": Rectangle {
+            background: #1f3a5f;
+            height: 28px;
+            Text { x: 12px; text: "ℹ " + root.gpu-banner; color: #bcd6ff; font-size: 12px; vertical-alignment: center; }
+        }
+
+        HorizontalLayout {
+            // ---------- left: table
+            VerticalLayout {
+                horizontal-stretch: 1;
+                padding: 10px;
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 34px;
+                    LineEdit {
+                        placeholder-text: "Search name or appid";
+                        text <=> root.search;
+                        edited => { root.filters-changed(); }
+                        horizontal-stretch: 1;
+                    }
+                    Switch {
+                        text: "Orphaned only";
+                        checked <=> root.orphan-only;
+                        toggled => { root.filters-changed(); }
+                    }
+                    Button { text: root.scanning ? "Scanning…" : "Rescan"; enabled: !root.scanning; clicked => { root.rescan(); } }
+                    Switch {
+                        text: "Auto";
+                        checked <=> root.auto-rescan;
+                        toggled => { root.auto-rescan-changed(root.auto-rescan); }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 34px;
+                    Button {
+                        text: "Clear orphaned (" + root.orphan-count + ", " + root.orphan-size + ")";
+                        enabled: root.orphan-count > 0 && !root.scanning;
+                        clicked => { root.request-clear(1, false); }
+                    }
+                    Button {
+                        text: "Clear selected (" + root.selected-count + ", " + root.selected-size + ")";
+                        enabled: root.selected-count > 0 && !root.scanning;
+                        clicked => { root.request-clear(0, false); }
+                    }
+                    Button {
+                        text: "Rebuild selected";
+                        enabled: root.selected-count > 0 && !root.scanning;
+                        clicked => { root.request-clear(0, true); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: "Select all"; clicked => { root.select-all(true); } }
+                    Button { text: "None"; clicked => { root.select-all(false); } }
+                }
+                if root.scanning: ProgressIndicator { progress: root.progress; height: 4px; }
+
+                Rectangle {
+                    background: Pal.panel;
+                    border-color: Pal.border;
+                    border-width: 1px;
+                    border-radius: 6px;
+                    VerticalLayout {
+                        padding: 1px;
+                        HorizontalLayout {
+                            height: 28px;
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            Rectangle { width: 34px; }
+                            Head { horizontal-stretch: 1; label: "Game"; active: root.sort-col == 0; asc: root.sort-asc; clicked => { root.sort-by(0); } }
+                            Head { width: 80px; label: "AppID"; active: root.sort-col == 1; asc: root.sort-asc; clicked => { root.sort-by(1); } }
+                            Head { width: 150px; label: "Library"; active: root.sort-col == 2; asc: root.sort-asc; clicked => { root.sort-by(2); } }
+                            Head { width: 150px; label: "Cache size"; active: root.sort-col == 3; asc: root.sort-asc; clicked => { root.sort-by(3); } }
+                            Head { width: 90px; label: "Modified"; active: root.sort-col == 4; asc: root.sort-asc; clicked => { root.sort-by(4); } }
+                            Head { width: 74px; label: "Installed"; active: root.sort-col == 5; asc: root.sort-asc; clicked => { root.sort-by(5); } }
+                        }
+                        Rectangle { height: 1px; background: Pal.border; }
+                        ListView {
+                            for row[i] in root.rows: Rectangle {
+                                height: 30px;
+                                background: row.selected ? #4c8dff33 : (mod(i, 2) == 0 ? transparent : Pal.alt);
+                                TouchArea { clicked => { root.open-row(row.id); } }
+                                HorizontalLayout {
+                                    padding-left: 8px;
+                                    padding-right: 8px;
+                                    CheckBox {
+                                        width: 34px;
+                                        checked: row.selected;
+                                        toggled => { root.toggle(row.id); }
+                                    }
+                                    Cell { horizontal-stretch: 1; text: row.name; }
+                                    Cell { width: 80px; text: row.appid; color: Pal.dim; }
+                                    Cell { width: 150px; text: row.library; color: Pal.dim; }
+                                    Rectangle {
+                                        width: 150px;
+                                        Rectangle {
+                                            x: 0; y: 8px; height: parent.height - 16px;
+                                            width: (parent.width - 8px) * row.frac;
+                                            background: row.orphan ? #e0a03055 : #4c8dff44;
+                                            border-radius: 3px;
+                                        }
+                                        Cell { x: 4px; width: parent.width - 8px; text: row.size; }
+                                    }
+                                    Cell { width: 90px; text: row.modified; color: Pal.dim; }
+                                    Cell { width: 74px; text: row.status; color: row.orphan ? Pal.warn : Pal.dim; }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // global driver caches (not per-game)
+                Text { text: "Global driver caches"; color: Pal.dim; font-size: 12px; font-weight: 600; }
+                Rectangle {
+                    background: Pal.panel;
+                    border-color: Pal.border;
+                    border-width: 1px;
+                    border-radius: 6px;
+                    height: min(34px + root.globals.length * 28px, 140px);
+                    ListView {
+                        for g in root.globals: Rectangle {
+                            height: 28px;
+                            background: g.selected ? #4c8dff33 : transparent;
+                            TouchArea { clicked => { root.open-global(g.id); } }
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                CheckBox { width: 34px; checked: g.selected; toggled => { root.toggle-global(g.id); } }
+                                Cell { horizontal-stretch: 1; text: g.name; }
+                                Cell { width: 100px; text: g.size; }
+                                Cell { width: 90px; text: g.modified; color: Pal.dim; }
+                            }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    height: 20px;
+                    Text { text: root.total-text; color: Pal.fg; font-size: 13px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; }
+                    Text { text: root.status-text; color: Pal.dim; font-size: 12px; vertical-alignment: center; horizontal-alignment: right; overflow: elide; }
+                }
+            }
+
+            // ---------- right: details
+            Rectangle {
+                width: 340px;
+                background: Pal.panel;
+                Rectangle { x: 0; width: 1px; background: Pal.border; }
+                ScrollView {
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 10px;
+                        alignment: start;
+                        if root.detail-title != "": VerticalLayout {
+                            spacing: 10px;
+                            alignment: start;
+                            Text { text: root.detail-title; color: Pal.fg; font-size: 16px; font-weight: 700; wrap: word-wrap; }
+                            Text { text: root.detail-text; color: Pal.fg; font-size: 12px; wrap: word-wrap; }
+                            Text { text: root.detail-extra; color: Pal.dim; font-size: 12px; wrap: word-wrap; }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Button { text: "Clear this cache"; clicked => { root.request-clear(2, false); } }
+                                Button { text: "Rebuild"; clicked => { root.request-clear(2, true); } }
+                            }
+                        }
+                        if root.detail-title == "": VerticalLayout {
+                            spacing: 10px;
+                            alignment: start;
+                            Text { text: "Overview"; color: Pal.fg; font-size: 16px; font-weight: 700; }
+                            Text { text: root.overview-text; color: Pal.fg; font-size: 12px; wrap: word-wrap; }
+                            Text { text: "Select a row to see its paths and file breakdown."; color: Pal.dim; font-size: 12px; wrap: word-wrap; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------- confirmation overlay
+    if root.confirm-visible: Rectangle {
+        background: #000000aa;
+        TouchArea { }
+        Rectangle {
+            width: min(parent.width - 60px, 760px);
+            height: min(parent.height - 60px, 520px);
+            background: Pal.panel;
+            border-radius: 10px;
+            border-color: Pal.border;
+            border-width: 1px;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 10px;
+                Text {
+                    text: root.confirm-permanent ? "Permanently delete these caches?" : "Move these caches to the Trash?";
+                    color: root.confirm-permanent ? Pal.danger : Pal.fg;
+                    font-size: 17px;
+                    font-weight: 700;
+                }
+                if root.confirm-note != "": Text { text: root.confirm-note; color: Pal.warn; font-size: 12px; wrap: word-wrap; }
+                Rectangle {
+                    background: Pal.bg;
+                    border-radius: 6px;
+                    vertical-stretch: 1;
+                    ScrollView {
+                        Text { x: 8px; y: 6px; width: parent.width - 16px; text: root.confirm-text; color: Pal.fg; font-size: 12px; wrap: word-wrap; }
+                    }
+                }
+                Text { text: root.confirm-total; color: Pal.fg; font-size: 14px; font-weight: 600; }
+                CheckBox { text: "Delete permanently (cannot be undone)"; checked <=> root.confirm-permanent; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    Button { text: "Cancel"; clicked => { root.confirm-cancel(); } }
+                    Button {
+                        text: root.confirm-permanent ? "Delete permanently" : "Move to Trash";
+                        primary: true;
+                        clicked => { root.confirm-ok(root.confirm-permanent); }
+                    }
+                }
+            }
+        }
+    }
+}

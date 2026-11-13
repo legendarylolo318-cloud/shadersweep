@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=shadersweep
+GenericName=Shader Cache Manager
+Comment=See and clear per-game shader cache disk usage
+Exec=shadersweep-gui
+Icon=shadersweep
+Terminal=false
+Categories=Utility;System;Game;
+Keywords=steam;shader;cache;cleanup;disk;
