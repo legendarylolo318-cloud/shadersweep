@@ -18,6 +18,16 @@ use std::time::{Duration, Instant};
 
 slint::include_modules!();
 
+// glibc 2.35/2.43 added new symbol versions of these libm functions; binding to the
+// x86_64 baseline versions keeps the AppImage runnable on older distributions
+// (results are identical, the new versions are only faster).
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+std::arch::global_asm!(
+    ".symver acosf, acosf@GLIBC_2.2.5",
+    ".symver atan2f, atan2f@GLIBC_2.2.5",
+    ".symver hypotf, hypotf@GLIBC_2.2.5",
+);
+
 #[derive(Clone, PartialEq)]
 enum Detail {
     Game(PathBuf),
@@ -366,6 +376,18 @@ impl App {
             }
         }
         ui.set_status_text(tr(format!("Scanned in {} ms", inv.scan_ms)));
+        if std::env::var_os("SHADERSWEEP_LOG").is_some() {
+            eprintln!(
+                "shadersweep: scanned {} caches ({} driver caches) in {} libraries in {} ms",
+                inv.entries.len(),
+                inv.globals.len(),
+                inv.libraries.len(),
+                inv.scan_ms
+            );
+            for w in &inv.warnings {
+                eprintln!("shadersweep: warning: {w}");
+            }
+        }
         self.inv = inv;
         self.compat_sizes.clear();
         self.scanning = false;
