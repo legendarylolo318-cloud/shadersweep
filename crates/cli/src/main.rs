@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use shadersweep_core::guard::{Allowlist, ProcessProbe, ProcfsProbe};
+use shadersweep_core::guard::{Allowlist, ProcfsProbe};
 use shadersweep_core::ops::{self, DeleteMode, Selection};
 use shadersweep_core::scan::{self, Inventory, ScanOptions};
 use shadersweep_core::stats;
@@ -37,10 +37,10 @@ enum Cmd {
         /// Also clear every orphaned cache
         #[arg(long)]
         orphaned: bool,
-        /// Delete permanently instead of moving to the Trash
+        /// Delete permanently instead of moving to the Trash (requires --yes)
         #[arg(long)]
         permanent: bool,
-        /// Do not ask for confirmation
+        /// Do not ask for confirmation (mandatory together with --permanent)
         #[arg(long, short = 'y')]
         yes: bool,
     },
@@ -71,6 +71,14 @@ fn confirm(prompt: &str) -> Result<bool> {
     let mut s = String::new();
     std::io::stdin().lock().read_line(&mut s)?;
     Ok(matches!(s.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+/// Permanent deletion is never interactive: it needs both `--permanent` and `--yes`.
+fn check_permanent_flags(permanent: bool, yes: bool) -> Result<()> {
+    if permanent && !yes {
+        bail!("--permanent deletes without the Trash and cannot be undone; pass --permanent --yes to confirm");
+    }
+    Ok(())
 }
 
 fn launch_gui() -> Result<()> {
@@ -183,13 +191,19 @@ fn main() -> Result<()> {
             if appids.is_empty() && !orphaned {
                 bail!("give at least one appid or --orphaned");
             }
+            check_permanent_flags(permanent, yes)?;
             let inv = load()?;
+            for id in &appids {
+                if !inv.entries.iter().any(|e| e.appid == *id) {
+                    eprintln!("no shader cache found for appid {id}");
+                }
+            }
             let allow = Allowlist::from_inventory(&inv);
             let probe = ProcfsProbe::default();
             let sel = Selection {
                 appids,
                 orphaned,
-                globals: vec![],
+                ..Default::default()
             };
             let plan = ops::plan_clear(&inv, &allow, &probe, &sel);
             for r in &plan.refused {
@@ -238,12 +252,63 @@ fn main() -> Result<()> {
                 rep.done.len(),
                 human_size(rep.freed)
             );
-            let _: &dyn ProcessProbe = &probe;
             if rep.failed.is_empty() {
                 Ok(())
             } else {
                 std::process::exit(1)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clear(args: &[&str]) -> Option<(Vec<u32>, bool, bool, bool)> {
+        let mut v = vec!["shadersweep", "clear"];
+        v.extend_from_slice(args);
+        match Cli::try_parse_from(v).ok()?.cmd? {
+            Cmd::Clear {
+                appids,
+                orphaned,
+                permanent,
+                yes,
+            } => Some((appids, orphaned, permanent, yes)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn default_is_trash() {
+        assert_eq!(clear(&["100"]), Some((vec![100], false, false, false)));
+        assert_eq!(clear(&["100", "-y"]), Some((vec![100], false, false, true)));
+    }
+
+    #[test]
+    fn permanent_needs_yes() {
+        assert!(check_permanent_flags(true, false).is_err());
+        assert!(check_permanent_flags(true, true).is_ok());
+        assert!(check_permanent_flags(false, false).is_ok());
+        assert_eq!(
+            clear(&["--permanent", "--yes", "7"]),
+            Some((vec![7], false, true, true))
+        );
+    }
+
+    #[test]
+    fn appids_must_be_numbers() {
+        for bad in [
+            "../../",
+            "..",
+            "/",
+            "~",
+            "100/../..",
+            "-1",
+            "4294967296",
+            "1e3",
+        ] {
+            assert!(clear(&[bad]).is_none(), "{bad} accepted");
         }
     }
 }
